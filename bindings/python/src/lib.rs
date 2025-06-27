@@ -460,7 +460,9 @@ impl Open {
             match framework {
                 Framework::Pytorch => {
                     let module = PyModule::import(py, intern!(py, "torch"))?;
-                    TORCH_MODULE.get_or_init_py_attached(py, || module.into())
+                    let np_module = PyModule::import(py, intern!(py, "numpy"))?;
+                    TORCH_MODULE.get_or_init_py_attached(py, || module.into());
+                    NUMPY_MODULE.get_or_init_py_attached(py, || np_module.into())
                 }
                 _ => {
                     let module = PyModule::import(py, intern!(py, "numpy"))?;
@@ -472,55 +474,55 @@ impl Open {
         })?;
 
         let storage = match &framework {
-            Framework::Pytorch => Python::with_gil(|py| -> PyResult<Storage> {
-                let module = get_module(py, &TORCH_MODULE)?;
+            // Framework::Pytorch => Python::with_gil(|py| -> PyResult<Storage> {
+            //     let module = get_module(py, &TORCH_MODULE)?;
 
-                let version: String = module.getattr(intern!(py, "__version__"))?.extract()?;
-                let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
+            //     let version: String = module.getattr(intern!(py, "__version__"))?.extract()?;
+            //     let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
 
-                // Untyped storage only exists for versions over 1.11.0
-                // Same for torch.asarray which is necessary for zero-copy tensor
-                if version >= Version::new(1, 11, 0) {
-                    // storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
-                    let py_filename: PyObject = filename
-                        .to_str()
-                        .ok_or_else(|| {
-                            SafetensorError::new_err(format!(
-                                "Path {} is not valid UTF-8",
-                                filename.display()
-                            ))
-                        })?
-                        .into_pyobject(py)?
-                        .into();
-                    let size: PyObject = buffer.len().into_pyobject(py)?.into();
-                    let shared: PyObject = PyBool::new(py, false).to_owned().into();
-                    let (size_name, storage_name) = if version >= Version::new(2, 0, 0) {
-                        (intern!(py, "nbytes"), intern!(py, "UntypedStorage"))
-                    } else {
-                        (intern!(py, "size"), intern!(py, "ByteStorage"))
-                    };
+            //     // Untyped storage only exists for versions over 1.11.0
+            //     // Same for torch.asarray which is necessary for zero-copy tensor
+            //     if version >= Version::new(1, 11, 0) {
+            //         // storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
+            //         let py_filename: PyObject = filename
+            //             .to_str()
+            //             .ok_or_else(|| {
+            //                 SafetensorError::new_err(format!(
+            //                     "Path {} is not valid UTF-8",
+            //                     filename.display()
+            //                 ))
+            //             })?
+            //             .into_pyobject(py)?
+            //             .into();
+            //         let size: PyObject = buffer.len().into_pyobject(py)?.into();
+            //         let shared: PyObject = PyBool::new(py, false).to_owned().into();
+            //         let (size_name, storage_name) = if version >= Version::new(2, 0, 0) {
+            //             (intern!(py, "nbytes"), intern!(py, "UntypedStorage"))
+            //         } else {
+            //             (intern!(py, "size"), intern!(py, "ByteStorage"))
+            //         };
 
-                    let kwargs =
-                        [(intern!(py, "shared"), shared), (size_name, size)].into_py_dict(py)?;
-                    let storage = module
-                        .getattr(storage_name)?
-                        // .getattr(intern!(py, "from_file"))?
-                        .call_method("from_file", (py_filename,), Some(&kwargs))?;
+            //         let kwargs =
+            //             [(intern!(py, "shared"), shared), (size_name, size)].into_py_dict(py)?;
+            //         let storage = module
+            //             .getattr(storage_name)?
+            //             // .getattr(intern!(py, "from_file"))?
+            //             .call_method("from_file", (py_filename,), Some(&kwargs))?;
 
-                    let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped"))
-                    {
-                        Ok(untyped) => untyped,
-                        Err(_) => storage.getattr(intern!(py, "_untyped"))?,
-                    };
-                    let storage = untyped.call0()?.into_pyobject(py)?.into();
-                    let gil_storage = OnceLock::new();
-                    gil_storage.get_or_init_py_attached(py, || storage);
+            //         let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped"))
+            //         {
+            //             Ok(untyped) => untyped,
+            //             Err(_) => storage.getattr(intern!(py, "_untyped"))?,
+            //         };
+            //         let storage = untyped.call0()?.into_pyobject(py)?.into();
+            //         let gil_storage = OnceLock::new();
+            //         gil_storage.get_or_init_py_attached(py, || storage);
 
-                    Ok(Storage::TorchStorage(gil_storage))
-                } else {
-                    Ok(Storage::Mmap(buffer))
-                }
-            })?,
+            //         Ok(Storage::TorchStorage(gil_storage))
+            //     } else {
+            //         Ok(Storage::Mmap(buffer))
+            //     }
+            // })?,
             _ => Storage::Mmap(buffer),
         };
 
@@ -1094,7 +1096,7 @@ fn create_tensor<'a>(
     Python::with_gil(|py| -> PyResult<PyObject> {
         let (module, is_numpy): (&PyBound<'_, PyModule>, bool) = match framework {
             Framework::Pytorch => (
-                TORCH_MODULE
+                NUMPY_MODULE
                     .get()
                     .ok_or_else(|| {
                         SafetensorError::new_err(format!("Could not find module {framework}",))
@@ -1193,8 +1195,10 @@ fn create_tensor<'a>(
             }
             Framework::Pytorch => {
                 if device != &Device::Cpu {
-                    let device: PyObject = device.clone().into_pyobject(py)?.into();
+                    let torch_module = get_module(py, &TORCH_MODULE)?;
                     let kwargs = PyDict::new(py);
+                    tensor = torch_module.call_method("from_numpy", (tensor,), Some(&kwargs))?;
+                    let device: PyObject = device.clone().into_pyobject(py)?.into();
                     tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
                 }
                 tensor

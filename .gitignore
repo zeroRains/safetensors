@@ -8,3 +8,5 @@ bindings/python/Cargo.lock
 *.pdparams
 *.safetensors
 *.npz
+
+.vscode

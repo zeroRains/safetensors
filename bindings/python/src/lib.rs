@@ -488,6 +488,8 @@ impl Open {
 
         let storage = match &framework {
             Framework::Paddle => Python::with_gil(|py| -> PyResult<Storage> {
+                let paddle = get_module(py, &PADDLE_MODULE)?;
+                // todo: version check, only paddle 3.1 or develop
                 let py_filename: PyObject = filename
                             .to_str()
                             .ok_or_else(|| {
@@ -499,7 +501,6 @@ impl Open {
                             .into_pyobject(py)?
                             .into();
                 let size: PyObject = buffer.len().into_pyobject(py)?.into();
-                let paddle = get_module(py, &PADDLE_MODULE)?;
                 let init_kargs = [
                     (intern!(py, "filename"), py_filename),
                     (intern!(py, "nbytes"), size),
@@ -1214,6 +1215,8 @@ impl PySafeSlice {
                                         .call((), Some(&slice_kwargs))?;
                 let mut tensor = storage_slice.getattr(intern!(py, "view"))?
                                         .call1((dtype,))?;
+                let sys = PyModule::import(py, intern!(py, "sys"))?;
+                let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
                 if byteorder == "big" {
                     let inplace_kwargs =
                         [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
@@ -1289,15 +1292,6 @@ fn create_tensor<'a>(
                     .bind(py),
                 false,
             ),
-            Framework::Paddle => (
-                PADDLE_MODULE
-                    .get()
-                    .ok_or_else(|| {
-                        SafetensorError::new_err(format!("Could not find module {framework}",))
-                    })?
-                    .bind(py),
-                false,
-            ),
             frame => {
                 // Attempt to load the frameworks
                 // Those are needed to prepare the ml dtypes
@@ -1309,6 +1303,9 @@ fn create_tensor<'a>(
                     Framework::Flax => {
                         let _ = PyModule::import(py, intern!(py, "flax"));
                     }
+                    Framework::Paddle => {
+                        let _ = PyModule::import(py, intern!(py, "paddle"));
+                    }
                     _ => {}
                 };
 
@@ -1319,9 +1316,6 @@ fn create_tensor<'a>(
             }
         };
         let mut cur_type = dtype;
-        if *framework == Framework::Paddle && cur_type == Dtype::U16 {
-            cur_type = Dtype::BF16;
-        }
         let dtype: PyObject = get_pydtype(module, cur_type, is_numpy)?;
         let count: usize = shape.iter().product();
         let shape = shape.to_vec();
@@ -1339,7 +1333,6 @@ fn create_tensor<'a>(
             let kwargs = [
                 (intern!(py, "buffer"), array),
                 (intern!(py, "dtype"), dtype),
-                (intern!(py, "place"), device)
             ]
             .into_py_dict(py)?;
             let mut tensor = module.call_method("frombuffer", (), Some(&kwargs))?;
@@ -1388,20 +1381,22 @@ fn create_tensor<'a>(
                     // .getattr(intern!(py, "array"))?
                     .call_method1("array", (tensor,))?
             }
+            Framework::Paddle => {
+                let module = Python::with_gil(|py| -> PyResult<&Py<PyModule>> {
+                    let module = PyModule::import(py, intern!(py, "paddle"))?;
+                    Ok(PADDLE_MODULE.get_or_init_py_attached(py, || module.into()))
+                })?
+                .bind(py);
+                module
+                    .getattr(intern!(py, "to_tensor"))?
+                    .call1((tensor,))?
+            }
             Framework::Pytorch => {
                 if device != &Device::Cpu {
                     let device: PyObject = device.clone().into_pyobject(py)?.into();
                     let kwargs = PyDict::new(py);
                     tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
                 }
-                tensor
-            }
-            Framework::Paddle => {
-                // if device != &Device::Cpu {
-                //     let device: PyObject = device.clone().into_pyobject(py)?.into();
-                //     let kwargs = PyDict::new(py);
-                //     tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
-                // }
                 tensor
             }
             Framework::Numpy => tensor,

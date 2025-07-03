@@ -1,6 +1,6 @@
 import time
 
-file_path = "/home/lulinjun/workspace/model_zoo/pre_train_model/models/Qwen/Qwen2.5-7B-Instruct/model-00004-of-00004.safetensors"
+file_path = "/root/paddlejob/workspace/env_run/output/liuyuanle/0_Origin_Models/ernie-4_5-21b-a3b-bf16-paddle/model-00008-of-00009.safetensors"
 
 """
 # !test for load_file
@@ -23,10 +23,10 @@ for k,v in tensors.items():
 
 # !test for safe_open
 from safetensors import safe_open
-from paddle_safe_open import fast_safe_open
+
 import paddle
 
-device = "gpu"  # or "cuda:0" for GPU
+device = "cpu"  # or "cuda:0" for GPU
 tensors = {}
 def torch_test():
     s = time.perf_counter()
@@ -44,6 +44,7 @@ def numpy_test():
     return (e-s)*1e3
 def paddlenlp_test():
     s = time.perf_counter()
+    from paddle_safe_open import fast_safe_open
     with fast_safe_open(file_path, framework="np") as f:
         for k in f.keys():
             tensors[k] = paddle.to_tensor(f.get_tensor(k), place=device)
@@ -57,10 +58,10 @@ def paddle_test():
     e = time.perf_counter()
     return (e-s)*1e3
 
-t = torch_test()
+# t = torch_test()
 # t = numpy_test()
 # t = paddlenlp_test()
-# t = paddle_test()
+t = paddle_test()
 for k, v in tensors.items():
     print(k, v)
 
@@ -91,7 +92,7 @@ padddle(MMap):              3118.960987776518
 
 
 """
-
+/root/paddlejob/workspace/env_run/output/liuyuanle/0_Origin_Models/ernie-4_5-21b-a3b-bf16-paddle
 file: /root/.paddlenlp/models/Qwen/Qwen2.5-7B-Instruct/model-00004-of-00004.safetensors
 size: 3.4GB
 tensors: 63

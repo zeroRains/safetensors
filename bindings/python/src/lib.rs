@@ -390,6 +390,7 @@ enum Storage {
     /// so Pytorch can handle the whole lifecycle.
     /// https://pytorch.org/docs/stable/storage.html#torch.TypedStorage.from_file.
     TorchStorage(OnceLock<PyObject>),
+    PaddleStorage(OnceLock<PyObject>),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd)]
@@ -486,6 +487,33 @@ impl Open {
         })?;
 
         let storage = match &framework {
+            Framework::Paddle => Python::with_gil(|py| -> PyResult<Storage> {
+                let py_filename: PyObject = filename
+                            .to_str()
+                            .ok_or_else(|| {
+                                SafetensorError::new_err(format!(
+                                    "Path {} is not valid UTF-8",
+                                    filename.display()
+                                ))
+                            })?
+                            .into_pyobject(py)?
+                            .into();
+                let size: PyObject = buffer.len().into_pyobject(py)?.into();
+                let paddle = get_module(py, &PADDLE_MODULE)?;
+                let init_kargs = [
+                    (intern!(py, "filename"), py_filename),
+                    (intern!(py, "nbytes"), size),
+                ]
+                .into_py_dict(py)?;
+                let storage = paddle
+                                .getattr(intern!(py, "MmapStorage"))?
+                                .call((),Some(&init_kargs))?
+                                .into_pyobject(py)?
+                                .into();
+                let gil_storage = OnceLock::new();
+                gil_storage.get_or_init_py_attached(py, || storage);
+                Ok(Storage::PaddleStorage(gil_storage))
+            })?,
             Framework::Pytorch => Python::with_gil(|py| -> PyResult<Storage> {
                 let module = get_module(py, &TORCH_MODULE)?;
 
@@ -619,6 +647,83 @@ impl Open {
                     array,
                     &self.device,
                 )
+            }
+            Storage::PaddleStorage(storage) => {
+                Python::with_gil(|py| -> PyResult<PyObject> {
+                    let paddle = get_module(py, &PADDLE_MODULE)?;
+                    let mut cur_type = info.dtype;
+                    if cur_type == Dtype::U16 { // paddle set u16 as bf16
+                        cur_type = Dtype::BF16;
+                    }
+                    let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
+                    let paddle_uint8: PyObject = get_pydtype(paddle, Dtype::U8, false)?;
+                    let mut shape = info.shape.to_vec();
+                        if cur_type == Dtype::F4 {
+                            let n = shape.len();
+                            if shape[n - 1] % 2 != 0 {
+                                return Err(SafetensorError::new_err(format!(
+                        "f4_x2 dtype requires that the last dim be divisible by 2 in torch: got {shape:?}",
+                                )));
+                            }
+                            shape[n - 1] /= 2;
+                        }
+                    let shape: PyObject = shape.into_pyobject(py)?.into();
+                    let start = (info.data_offsets.0 + self.offset) as isize;
+                    let stop = (info.data_offsets.1 + self.offset) as isize;
+
+                    let kwargs = [
+                            (intern!(py, "dtype"), paddle_uint8),
+                            (intern!(py, "start"), start.into_pyobject(py)?.into()),
+                            (intern!(py, "stop"), stop.into_pyobject(py)?.into()),
+                        ]
+                        .into_py_dict(py)?;
+                    let sys = PyModule::import(py, intern!(py, "sys"))?;
+                    let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
+                    let storage: &PyObject = storage.get()
+                                                        .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
+                    let storage: &PyBound<PyAny> = storage.bind(py);
+                    let storage_slice = storage.getattr(intern!(py, "get_slice"))?
+                                            .call((), Some(&kwargs))?; 
+                    let mut tensor = storage_slice
+                                        .getattr(intern!(py, "view"))?
+                                        .call1((dtype,))?;
+
+                    if byteorder == "big" {
+                        let inplace_kwargs =
+                            [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
+
+                        let intermediary_dtype = match cur_type {
+                            Dtype::BF16 => Some(Dtype::F16),
+                            Dtype::F8_E5M2 => Some(Dtype::U8),
+                            Dtype::F8_E4M3 => Some(Dtype::U8),
+                            Dtype::F8_E8M0 => Some(Dtype::U8),
+                            _ => None,
+                        };
+                        if let Some(intermediary_dtype) = intermediary_dtype {
+                            // Reinterpret to f16 for numpy compatibility.
+                            let dtype: PyObject = get_pydtype(paddle, intermediary_dtype, false)?;
+                            tensor = tensor
+                                .getattr(intern!(py, "view"))?
+                                .call1((dtype,))?;
+                        }
+                        let numpy = tensor
+                            .getattr(intern!(py, "numpy"))?
+                            .call0()?
+                            .getattr("byteswap")?
+                            .call((), Some(&inplace_kwargs))?;
+                        tensor = paddle.getattr(intern!(py, "to_tensor"))?.call1((numpy,))?;
+                        if intermediary_dtype.is_some() {
+                            // Reinterpret to f16 for numpy compatibility.
+                            let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
+                            tensor = tensor
+                                .getattr(intern!(py, "view"))?
+                                .call1((dtype,))?;
+                        }
+                    }
+                    
+                    let tensor = tensor.getattr(intern!(py, "reshape"))?.call1((shape,))?;
+                    Ok(tensor.into_pyobject(py)?.into())
+                })
             }
             Storage::TorchStorage(storage) => {
                 Python::with_gil(|py| -> PyResult<PyObject> {
@@ -1076,6 +1181,73 @@ impl PySafeSlice {
                     .call1((shape,))?
                     .getattr(intern!(py, "__getitem__"))?
                     .call1((slices,))?;
+                if self.device != Device::Cpu {
+                    let device: PyObject = self.device.clone().into_pyobject(py)?.into();
+                    let kwargs = PyDict::new(py);
+                    tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
+                }
+                Ok(tensor.into())
+            }),
+            Storage::PaddleStorage(storage) => Python::with_gil(|py| -> PyResult<PyObject> {
+                let paddle = get_module(py, &PADDLE_MODULE)?;
+                let mut cur_type = self.info.dtype;
+                if cur_type == Dtype::U16{
+                    cur_type = Dtype::BF16;
+                }
+                let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
+                let paddle_uint8: PyObject = get_pydtype(paddle, Dtype::U8, false)?;
+                let shape = self.info.shape.to_vec();
+                let shape: PyObject = shape.into_pyobject(py)?.into();
+                let start = (self.info.data_offsets.0 + self.offset) as isize;
+                let stop = (self.info.data_offsets.1 + self.offset) as isize;
+                let storage: &PyObject = storage
+                    .get()
+                    .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
+                let storage: &PyBound<'_, PyAny> = storage.bind(py);
+                let slice_kwargs = [
+                    (intern!(py, "dtype"), paddle_uint8),
+                    (intern!(py, "start"), start.into_pyobject(py)?.into()),
+                    (intern!(py, "stop"), stop.into_pyobject(py)?.into()),
+                ]
+                .into_py_dict(py)?;
+                let storage_slice = storage.getattr(intern!(py, "get_slice"))?
+                                        .call((), Some(&slice_kwargs))?;
+                let mut tensor = storage_slice.getattr(intern!(py, "view"))?
+                                        .call1((dtype,))?;
+                if byteorder == "big" {
+                    let inplace_kwargs =
+                        [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
+
+                    let intermediary_dtype = match cur_type {
+                        Dtype::BF16 => Some(Dtype::F16),
+                        Dtype::F8_E5M2 => Some(Dtype::U8),
+                        Dtype::F8_E4M3 => Some(Dtype::U8),
+                        Dtype::F8_E8M0 => Some(Dtype::U8),
+                        _ => None,
+                    };
+                    if let Some(intermediary_dtype) = intermediary_dtype {
+                        // Reinterpret to f16 for numpy compatibility.
+                        let dtype: PyObject = get_pydtype(paddle, intermediary_dtype, false)?;
+                        tensor = tensor
+                            .getattr(intern!(py, "view"))?
+                            .call1((dtype,))?;
+                    }
+                    let numpy = tensor
+                        .getattr(intern!(py, "numpy"))?
+                        .call0()?
+                        .getattr("byteswap")?
+                        .call((), Some(&inplace_kwargs))?;
+                    tensor = paddle.getattr(intern!(py, "to_tensor"))?.call1((numpy,))?;
+                    if intermediary_dtype.is_some() {
+                        // Reinterpret to f16 for numpy compatibility.
+                        let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
+                        tensor = tensor
+                            .getattr(intern!(py, "view"))?
+                            .call1((dtype,))?;
+                    }
+                }
+                tensor = tensor.getattr(intern!(py, "reshape"))?
+                            .call1((shape,))?;
                 if self.device != Device::Cpu {
                     let device: PyObject = self.device.clone().into_pyobject(py)?.into();
                     let kwargs = PyDict::new(py);
